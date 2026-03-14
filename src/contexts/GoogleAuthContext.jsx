@@ -1,7 +1,8 @@
-import React, { createContext, useState, useEffect, useContext } from 'react';
+import React, { createContext, useState, useEffect, useContext, useCallback } from 'react';
 import { useGoogleLogin } from '@react-oauth/google';
 import axios from 'axios';
 import toast from 'react-hot-toast';
+import { userTracking } from '../firebase';
 
 const GoogleAuthContext = createContext();
 
@@ -18,81 +19,84 @@ export const GoogleAuthProvider = ({ children }) => {
   const [loading, setLoading] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [allUsers, setAllUsers] = useState([]); // Track all logged in users
+  const [firebaseReady, setFirebaseReady] = useState(false);
 
-  // Load users from localStorage on mount
+  // Load users from Firebase on mount
   useEffect(() => {
-    const savedUser = localStorage.getItem('google_user');
-    if (savedUser) {
-      const parsedUser = JSON.parse(savedUser);
-      setUser(parsedUser);
-      setIsAuthenticated(true);
-    }
+    const loadInitialData = async () => {
+      try {
+        // Load current user from localStorage (for session persistence)
+        const savedUser = localStorage.getItem('google_user');
+        if (savedUser) {
+          const parsedUser = JSON.parse(savedUser);
+          setUser(parsedUser);
+          setIsAuthenticated(true);
+        }
 
-    // Load all users for admin tracking
-    const savedUsers = localStorage.getItem('all_logged_in_users');
-    if (savedUsers) {
-      setAllUsers(JSON.parse(savedUsers));
-    }
-  }, []);
-
-  // Save user to the tracking list
-  const saveUserToTracking = (userData) => {
-    const existingUsers = JSON.parse(localStorage.getItem('all_logged_in_users') || '[]');
-    
-    // Check if user already exists in tracking
-    const userExists = existingUsers.find(u => u.email === userData.email);
-    
-    const userTrackingData = {
-      ...userData,
-      lastLogin: new Date().toISOString(),
-      loginCount: userExists ? (userExists.loginCount || 1) + 1 : 1,
-      deviceInfo: {
-        userAgent: navigator.userAgent,
-        platform: navigator.platform,
-        language: navigator.language,
+        // Load all users from Firebase for admin tracking
+        const users = await userTracking.getAllUsers();
+        setAllUsers(users);
+        setFirebaseReady(true);
+        console.log('✅ Loaded users from Firebase:', users.length);
+      } catch (error) {
+        console.error('❌ Error loading initial data:', error);
+        toast.error('Failed to load user data');
       }
     };
 
-    let updatedUsers;
-    if (userExists) {
-      // Update existing user
-      updatedUsers = existingUsers.map(u => 
-        u.email === userData.email ? { ...u, ...userTrackingData } : u
-      );
-    } else {
-      // Add new user
-      updatedUsers = [...existingUsers, userTrackingData];
-    }
+    loadInitialData();
+  }, []);
 
-    localStorage.setItem('all_logged_in_users', JSON.stringify(updatedUsers));
-    setAllUsers(updatedUsers);
-  };
+  // Save user to Firebase tracking
+  const saveUserToTracking = useCallback(async (userData) => {
+    try {
+      // Save to Firebase (cross-device storage)
+      const savedUser = await userTracking.saveUser(userData);
+      
+      // Also save to localStorage for quick access (current device only)
+      localStorage.setItem('google_user', JSON.stringify(userData));
+      
+      // Refresh the allUsers list from Firebase
+      const updatedUsers = await userTracking.getAllUsers();
+      setAllUsers(updatedUsers);
+      
+      console.log('✅ User saved to Firebase:', userData.email);
+      return updatedUsers;
+    } catch (error) {
+      console.error('❌ Error saving user to tracking:', error);
+      toast.error('Failed to save user data');
+      return [];
+    }
+  }, []);
 
   // Update user profile
   const updateUserProfile = async (updatedData) => {
     try {
+      if (!user) {
+        throw new Error('No user logged in');
+      }
+
       const updatedUser = {
         ...user,
         ...updatedData,
         updatedAt: new Date().toISOString()
       };
 
-      // Update in main user storage
+      // Update in Firebase (cross-device)
+      await userTracking.updateUser(user.email, updatedData);
+      
+      // Update in localStorage (current device)
       localStorage.setItem('google_user', JSON.stringify(updatedUser));
       
-      // Update in tracking storage
-      const existingUsers = JSON.parse(localStorage.getItem('all_logged_in_users') || '[]');
-      const updatedUsers = existingUsers.map(u => 
-        u.email === user.email ? { ...u, ...updatedData, updatedAt: new Date().toISOString() } : u
-      );
-      localStorage.setItem('all_logged_in_users', JSON.stringify(updatedUsers));
+      // Refresh the allUsers list from Firebase
+      const updatedUsers = await userTracking.getAllUsers();
       setAllUsers(updatedUsers);
-      
       setUser(updatedUser);
+      
       toast.success('Profile updated successfully!');
       return true;
     } catch (error) {
-      console.error('Error updating profile:', error);
+      console.error('❌ Error updating profile:', error);
       toast.error('Failed to update profile');
       return false;
     }
@@ -102,12 +106,16 @@ export const GoogleAuthProvider = ({ children }) => {
     onSuccess: async (tokenResponse) => {
       setLoading(true);
       try {
+        console.log('📱 Google login success, fetching user info...');
+        
         const userInfo = await axios.get(
           'https://www.googleapis.com/oauth2/v3/userinfo',
           {
             headers: { Authorization: `Bearer ${tokenResponse.access_token}` }
           }
         );
+
+        console.log('👤 User info received:', userInfo.data);
 
         const userData = {
           ...userInfo.data,
@@ -120,22 +128,24 @@ export const GoogleAuthProvider = ({ children }) => {
           }
         };
 
-        localStorage.setItem('google_user', JSON.stringify(userData));
-        saveUserToTracking(userData);
+        // Save to Firebase (cross-device) and get updated users list
+        const updatedUsers = await saveUserToTracking(userData);
         
         setUser(userData);
         setIsAuthenticated(true);
         toast.success(`Welcome, ${userData.name}!`);
         
+        console.log('📊 Total tracked users:', updatedUsers.length);
+        
       } catch (error) {
-        console.error('Error fetching user info:', error);
+        console.error('❌ Error fetching user info:', error);
         toast.error('Failed to get user information');
       } finally {
         setLoading(false);
       }
     },
     onError: (error) => {
-      console.error('Login Failed:', error);
+      console.error('❌ Login Failed:', error);
       toast.error('Google login failed. Please try again.');
     },
     flow: 'implicit',
@@ -150,14 +160,28 @@ export const GoogleAuthProvider = ({ children }) => {
   };
 
   // Get all logged in users (for admin)
-  const getAllUsers = () => {
+  const getAllUsers = useCallback(() => {
+    console.log('📋 getAllUsers called, returning:', allUsers.length);
     return allUsers;
-  };
+  }, [allUsers]);
 
   // Get user by email
-  const getUserByEmail = (email) => {
+  const getUserByEmail = useCallback((email) => {
     return allUsers.find(u => u.email === email) || null;
-  };
+  }, [allUsers]);
+
+  // Refresh users from Firebase (useful for admin panel)
+  const refreshUsers = useCallback(async () => {
+    try {
+      const users = await userTracking.getAllUsers();
+      setAllUsers(users);
+      console.log('🔄 Refreshed users from Firebase:', users.length);
+      toast.success('User data refreshed');
+    } catch (error) {
+      console.error('❌ Error refreshing users:', error);
+      toast.error('Failed to refresh user data');
+    }
+  }, []);
 
   const value = {
     user,
@@ -167,7 +191,10 @@ export const GoogleAuthProvider = ({ children }) => {
     logout,
     updateUserProfile,
     getAllUsers,
-    getUserByEmail
+    getUserByEmail,
+    refreshUsers,
+    allUsers, // Direct access to users array
+    firebaseReady // Flag to check if Firebase is ready
   };
 
   return (
