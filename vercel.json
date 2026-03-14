@@ -1,8 +1,5 @@
 {
-  "rewrites": [{ "source": "/(.*)", "destination": "/" }],
-  "build": {
-    "env": {
-      "CI": "false"
-    }
-  }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/" }
+  ]
 }
